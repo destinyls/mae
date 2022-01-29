@@ -1,4 +1,4 @@
-# Copyright (c) Meta Platforms, Inc. and affiliates.
+## Copyright (c) Meta Platforms, Inc. and affiliates.
 # All rights reserved.
 
 # This source code is licensed under the license found in the
@@ -10,12 +10,21 @@
 
 import os
 import PIL
+import cv2
+import math
+import random
+import numpy as np
 
-from torchvision import transforms
+from skimage import feature, exposure
+from torchvision import datasets, transforms
 from torchvision.datasets.vision import VisionDataset
+from torchvision.datasets.folder import default_loader, make_dataset
+
 
 from timm.data import create_transform
 from timm.data.constants import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
+
+from typing import Any, Callable, cast, Dict, List, Optional, Tuple
 
 class DatasetFolder(VisionDataset):
     """A generic data loader where the samples are arranged in this way: ::
@@ -76,6 +85,13 @@ class DatasetFolder(VisionDataset):
         self.samples = samples
         self.targets = [s[1] for s in samples]
 
+        self.post_transform = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])])
+
+        self.p = 16
+        self.num_tokens = int(196 * (1 - 0.85))
+
     def _find_classes(self, dir: str) -> Tuple[List[str], Dict[str, int]]:
         """
         Finds the class folders in a dataset.
@@ -94,6 +110,86 @@ class DatasetFolder(VisionDataset):
         class_to_idx = {cls_name: i for i, cls_name in enumerate(classes)}
         return classes, class_to_idx
 
+    def mask_visualizing(self, sample, target, mask_preds, path="demo_mask"):
+        img = cv2.cvtColor(np.asarray(sample),cv2.COLOR_RGB2BGR)
+        h = w = img.shape[1] // self.p
+        img = img.reshape((h, self.p, w, self.p, 3))
+        img = np.einsum('hpwqc->hwpqc', img)
+
+        ids = np.argsort(mask_preds)
+        for id in ids[49:]:
+            img[int(id/14), int(id%14), :, :, :] = 125
+        img = np.einsum('hwpqc->hpwqc', img)
+        img = img.reshape((h * self.p, w * self.p, 3))
+        cv2.imwrite(os.path.join(path, str(target) + ".png"), img)
+
+    def statistic_masking(self, sample):
+        img = cv2.cvtColor(np.asarray(sample),cv2.COLOR_RGB2BGR)
+        h = w = img.shape[1] // self.p
+        img = img.reshape((h, self.p, w, self.p, 3))
+        img = np.einsum('hpwqc->hwpqc', img)
+        img = np.mean(img, axis=(2,3,4))
+        patch_min, patch_max = np.min(img), np.max(img)
+        img = (img - patch_min) / (patch_max - patch_min + 10e-6)
+        img_flatten = img.flatten()
+        mask_preds = np.random.rand(img_flatten.shape[0])
+        basket_dict = {}
+        for i in range(img_flatten.shape[0]):
+            id = math.floor(img_flatten[i] * self.num_tokens)
+            if id not in basket_dict:
+                basket_dict[id] = [i]
+            else:
+                basket_dict[id].append(i)
+        for id, basket in basket_dict.items():
+            token_id = random.sample(basket, 1)
+            mask_preds[token_id] = -1.5
+        return mask_preds
+
+    def statistic_random_masking(self, sample):
+        img = cv2.cvtColor(np.asarray(sample),cv2.COLOR_RGB2BGR)
+        h = w = img.shape[1] // self.p
+        img = img.reshape((h, self.p, w, self.p, 3))
+        img = np.einsum('hpwqc->hwpqc', img)
+        img = np.mean(img, axis=(2,3,4))
+        patch_min, patch_max = np.min(img), np.max(img)
+        img = (img - patch_min) / (patch_max - patch_min + 10e-6)
+        img_flatten = img.flatten()
+        mask_preds = np.random.rand(img_flatten.shape[0])
+        basket_dict = {}
+        for i in range(img_flatten.shape[0]):
+            id = math.floor(img_flatten[i] * self.num_tokens)
+            if id not in basket_dict:
+                basket_dict[id] = [i]
+            else:
+                basket_dict[id].append(i)
+        num_count = 0
+        while num_count < self.num_tokens:
+            for id in basket_dict.keys():
+                if len(basket_dict[id]) > 0 and random.random() < 1 / self.num_tokens:
+                    token_id = random.sample(basket_dict[id], 1)
+                    mask_preds[token_id] = -1.5
+                    num_count += 1
+                    basket_dict[id].remove(token_id)
+        return mask_preds
+
+    def edge_masking(self, sample, target):
+        img = cv2.cvtColor(np.asarray(sample),cv2.COLOR_RGB2GRAY)
+        '''  canny '''
+        # img = cv2.GaussianBlur(img, (3,3), 0)
+        # img = cv2.Canny(img, 100, 200)
+        ''' hog '''
+        fd, img = feature.hog(img, orientations=9, pixels_per_cell=[8,8],
+            cells_per_block=[2,2], visualize=True)
+
+        h = w = img.shape[1] // self.p
+        img = img.reshape((h, self.p, w, self.p, 1))
+        img = np.einsum('hpwqc->hwpqc', img)
+        img = np.mean(img, axis=(2,3,4))
+        patch_min, patch_max = np.min(img), np.max(img)
+        img = (img - patch_min) / (patch_max - patch_min + 10e-6)
+        mask_preds = 1 - img.flatten()
+        return mask_preds
+
     def __getitem__(self, index: int) -> Tuple[Any, Any]:
         """
         Args:
@@ -104,12 +200,16 @@ class DatasetFolder(VisionDataset):
         """
         path, target = self.samples[index]
         sample = self.loader(path)
+
         if self.transform is not None:
             sample = self.transform(sample)
         if self.target_transform is not None:
             target = self.target_transform(target)
-
-        return sample, target
+        mask_preds = self.statistic_masking(sample)
+        # self.mask_visualizing(sample, target, mask_preds)
+        
+        sample = self.post_transform(sample)
+        return sample, mask_preds, target
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -163,7 +263,6 @@ def build_dataset(is_train, args):
     dataset = datasets.ImageFolder(root, transform=transform)
 
     print(dataset)
-
     return dataset
 
 
@@ -202,3 +301,5 @@ def build_transform(is_train, args):
     t.append(transforms.ToTensor())
     t.append(transforms.Normalize(mean, std))
     return transforms.Compose(t)
+
+IMG_EXTENSIONS = (".jpg", ".jpeg", ".png", ".ppm", ".bmp", ".pgm", ".tif", ".tiff", ".webp")
